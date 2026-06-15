@@ -1,0 +1,26 @@
+# ===== Python =====
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.venv/
+venv/
+
+# ===== Données (volumineuses, non versionnées) =====
+data/*.csv
+data/*.csv.gz
+*.parquet
+
+# ===== JARs (téléchargés, non versionnés) =====
+hive-jars/*.jar
+
+# ===== Spark / Hive (artefacts locaux) =====
+spark-warehouse/
+metastore_db/
+derby.log
+
+# ===== OS / IDE =====
+.DS_Store
+.idea/
+.vscode/
+*.log

@@ -1,0 +1,125 @@
+# ============================================================
+#  E-Commerce Lakehouse — version simple
+#  MinIO · Spark · Hive · Kafka · Airflow
+#  Démarrage : docker compose up -d
+# ============================================================
+
+services:
+
+  # ---- Datalake S3 ----
+  minio:
+    image: minio/minio:latest
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: minio
+      MINIO_ROOT_PASSWORD: minio123
+    ports: ["9000:9000", "9001:9001"]
+    volumes: ["minio:/data"]
+
+  # Crée les buckets bronze/silver/gold
+  createbuckets:
+    image: minio/mc:latest
+    depends_on: [minio]
+    entrypoint: >
+      /bin/sh -c "
+      until mc alias set s3 http://minio:9000 minio minio123; do sleep 2; done;
+      mc mb -p s3/bronze s3/silver s3/gold;
+      echo 'buckets OK'; "
+
+  # ---- Backend Postgres (Hive + Airflow) ----
+  # v15 + md5 : le driver JDBC de Hive 3.1.3 ne supporte pas scram-sha-256 (défaut de PG16)
+  postgres:
+    image: postgres:15
+    environment:
+      POSTGRES_USER: hive
+      POSTGRES_PASSWORD: hive
+      POSTGRES_DB: metastore
+      POSTGRES_HOST_AUTH_METHOD: md5
+      POSTGRES_INITDB_ARGS: "--auth-host=md5"
+    volumes:
+      - "pg:/var/lib/postgresql/data"
+      - "./scripts/init-airflow-db.sql:/docker-entrypoint-initdb.d/init-airflow-db.sql"
+
+  # ---- Hive Metastore ----
+  hive:
+    image: apache/hive:3.1.3
+    depends_on: [postgres]
+    restart: on-failure
+    environment:
+      SERVICE_NAME: metastore
+      DB_DRIVER: postgres
+      IS_RESUME: "true"
+      SERVICE_OPTS: >-
+        -Djavax.jdo.option.ConnectionDriverName=org.postgresql.Driver
+        -Djavax.jdo.option.ConnectionURL=jdbc:postgresql://postgres:5432/metastore
+        -Djavax.jdo.option.ConnectionUserName=hive
+        -Djavax.jdo.option.ConnectionPassword=hive
+        -Dfs.s3a.endpoint=http://minio:9000
+        -Dfs.s3a.access.key=minio
+        -Dfs.s3a.secret.key=minio123
+        -Dfs.s3a.path.style.access=true
+        -Dfs.s3a.impl=org.apache.hadoop.fs.s3a.S3AFileSystem
+        -Dfs.s3a.connection.ssl.enabled=false
+    volumes:
+      - "./hive-jars:/opt/hive/auxlib"
+    ports: ["9083:9083"]
+
+  # ---- Spark (master + worker) — image officielle Apache ----
+  spark:
+    image: apache/spark:3.5.1
+    command: /opt/spark/bin/spark-class org.apache.spark.deploy.master.Master
+    environment:
+      SPARK_NO_DAEMONIZE: "true"
+    ports: ["8080:8080", "7077:7077"]
+    volumes: ["./jobs:/jobs", "./data:/data"]
+
+  spark-worker:
+    image: apache/spark:3.5.1
+    depends_on: [spark]
+    command: /opt/spark/bin/spark-class org.apache.spark.deploy.worker.Worker spark://spark:7077
+    environment:
+      SPARK_NO_DAEMONIZE: "true"
+      SPARK_WORKER_MEMORY: 4G
+      SPARK_WORKER_CORES: 2
+    volumes: ["./jobs:/jobs", "./data:/data"]
+
+  # ---- Kafka (mode KRaft, sans Zookeeper) — image officielle Apache ----
+  kafka:
+    image: apache/kafka:3.7.1
+    environment:
+      KAFKA_NODE_ID: 1
+      KAFKA_PROCESS_ROLES: controller,broker
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka:9093
+      KAFKA_LISTENERS: PLAINTEXT://:9092,CONTROLLER://:9093
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,CONTROLLER:PLAINTEXT
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+    ports: ["9092:9092"]
+
+  # ---- Airflow (tout-en-un) ----
+  airflow:
+    image: apache/airflow:2.9.3
+    depends_on: [postgres]
+    user: "0:0"                      # root : nécessaire pour accéder au socket Docker
+    environment:
+      AIRFLOW__CORE__EXECUTOR: LocalExecutor
+      AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://hive:hive@postgres:5432/airflow
+      AIRFLOW__CORE__LOAD_EXAMPLES: "False"
+    volumes:
+      - "./dags:/opt/airflow/dags"
+      - "./jobs:/jobs"
+      - "/var/run/docker.sock:/var/run/docker.sock"   # pilotage du conteneur Spark
+    ports: ["8088:8080"]
+    command: >
+      bash -c "
+        (command -v docker || (apt-get update && apt-get install -y docker.io)) &&
+        airflow db migrate &&
+        airflow users create -u admin -p admin -f a -l a -r Admin -e a@a.com || true &&
+        airflow standalone
+      "
+
+volumes:
+  minio:
+  pg: 
