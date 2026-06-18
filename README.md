@@ -1,7 +1,3 @@
-# Big Data Frameworks -- Ngy François, Theissen Antoine
-
-Projet pipeline de données complet pour le traitement de big data grace a des big data frameworks.
-
 # E-Commerce Lakehouse — Traitement de données massives
 
 Pipeline big data de bout en bout sur le dataset **eCommerce behavior** (~67M d'événements
@@ -69,9 +65,11 @@ Big-Data-Framework/
 │   └── org.wildfly.openssl_wildfly-openssl-1.0.7.Final.jar
 │
 ├── jobs/                           # scripts Spark (montés dans /jobs)
-│   ├── bronze_ingestion.py
-│   ├── silver_transform.py
-│   ├── gold_analytics.py
+│   ├── bronze_ingestion.py         # ingestion CSV -> Bronze
+│   ├── silver_transform.py         # nettoyage + sessions (instrumenté bench)
+│   ├── gold_analytics.py           # 3 tables analytiques + Hive
+│   ├── bench.py                    # module de mesure de performance
+│   ├── bench_compare.py            # comparatif des benchmarks
 │   ├── kafka_producer.py           # streaming (optionnel)
 │   ├── streaming_consumer.py       # streaming (optionnel)
 │   └── spark_session.py            # helper de session Spark
@@ -95,191 +93,215 @@ Big-Data-Framework/
 
 ## 4. Prérequis
 
-- **Docker Desktop** (avec WSV2 sur Windows)
-- **~6 Go de RAM** alloués à Docker minimum (le traitement Spark est gourmand)
+- **Docker Desktop** (avec WSL2 sur Windows)
+- **~6 Go de RAM** alloués à Docker minimum
 - Le dataset **2019-Nov.csv** placé dans `data/`
   → [eCommerce behavior data (Kaggle)](https://www.kaggle.com/datasets/mkechinov/ecommerce-behavior-data-from-multi-category-store)
 
 ---
 
-## 5. Installation pas à pas (reproductible de zéro)
+## 5. Installation complète — commandes dans l'ordre
 
-### Étape 1 — Démarrer la stack
+> ⚠️ **Suis cet ordre exact.** Le premier job Spark télécharge les JARs S3A, qui sont
+> ensuite copiés pour Hive. Inverser les étapes provoque des erreurs.
+
+### Étape 1 — Démarrer toute la stack
 
 ```bash
 docker compose up -d
 docker compose ps -a
 ```
 
-Au premier lancement, Docker télécharge toutes les images (~plusieurs minutes).
+Au premier lancement, Docker télécharge les images (~plusieurs minutes). Vérifie :
+- `createbuckets` = `Exited (0)` (crée les buckets puis s'arrête — normal)
+- tous les autres = `Up`
 
-Vérifie que tout tourne :
-- `createbuckets` doit être `Exited (0)` (il crée les buckets bronze/silver/gold puis s'arrête — normal)
-- tous les autres doivent être `Up`
+### Étape 2 — Initialiser le schéma Hive (UNE SEULE FOIS, sur base vierge)
 
-**Interfaces web :**
-| Service | URL | Login |
-|---|---|---|
-| Console MinIO | http://localhost:9001 | minio / minio123 |
-| Spark Master | http://localhost:8080 | — |
-| Airflow | http://localhost:8088 | admin / admin |
+Au tout premier démarrage (ou après un reset), la base est vide : il faut créer le schéma
+du metastore. Le `-e IS_RESUME=false` force l'initialisation.
 
-### Étape 2 — Préparer les JARs S3A pour Hive
+```bash
+docker compose run --rm -e IS_RESUME=false hive /opt/hive/bin/schematool -dbType postgres -initSchema
+```
 
-Hive a besoin des connecteurs S3A pour cataloguer des tables stockées sur MinIO.
-On les récupère depuis le conteneur Spark (qui les télécharge au premier `spark-submit`).
+Attends `schemaTool completed`, puis `Ctrl+C` pour sortir. Redémarre Hive proprement :
 
-D'abord, déclenche un téléchargement des JARs en lançant n'importe quel job avec `--packages`
-(voir étape 3), puis copie-les :
+```bash
+docker compose up -d hive
+docker compose ps hive          # doit être "Up" durablement
+```
+
+### Étape 3 — Ingestion Bronze (télécharge aussi les JARs S3A)
+
+```bash
+docker compose exec spark /opt/spark/bin/spark-submit --packages org.apache.hadoop:hadoop-aws:3.3.4 --conf spark.jars.ivy=/tmp/.ivy2 /jobs/bronze_ingestion.py /data/2019-Nov.csv
+```
+
+### Étape 4 — Copier les JARs S3A pour Hive
+
+Maintenant que Spark les a téléchargés (étape 3), on les copie et on recrée Hive :
 
 ```bash
 mkdir hive-jars
 docker compose cp spark:/tmp/.ivy2/jars/org.apache.hadoop_hadoop-aws-3.3.4.jar ./hive-jars/
 docker compose cp spark:/tmp/.ivy2/jars/com.amazonaws_aws-java-sdk-bundle-1.12.262.jar ./hive-jars/
 docker compose cp spark:/tmp/.ivy2/jars/org.wildfly.openssl_wildfly-openssl-1.0.7.Final.jar ./hive-jars/
-```
-
-Puis recrée Hive pour qu'il charge ces JARs :
-
-```bash
 docker compose up -d hive
-docker compose ps hive     # doit être "Up"
 ```
 
-### Étape 3 — Lancer le pipeline manuellement (Bronze → Silver → Gold)
+### Étape 5 — Transformation Silver
 
-Tous les jobs se lancent via `spark-submit` dans le conteneur Spark.
-
-**Note sur les options récurrentes :**
-- `--conf spark.jars.ivy=/tmp/.ivy2` : évite une erreur de cache Ivy de l'image officielle Spark
-- `--driver-memory 6g` : sans ça, Spark tourne avec ~434 Mo et plante en OutOfMemory
-- `--conf spark.sql.shuffle.partitions=64` : optimise le shuffle (sessions, agrégations)
-- `--jars ...` (et non `--packages`) pour le Gold : nécessaire pour que Hive accède à S3A
-
-**3.1 — Bronze (ingestion brute) :**
 ```bash
-docker compose exec spark /opt/spark/bin/spark-submit \
-  --packages org.apache.hadoop:hadoop-aws:3.3.4 \
-  --conf spark.jars.ivy=/tmp/.ivy2 \
-  /jobs/bronze_ingestion.py /data/2019-Nov.csv
+docker compose exec spark /opt/spark/bin/spark-submit --packages org.apache.hadoop:hadoop-aws:3.3.4 --conf spark.jars.ivy=/tmp/.ivy2 --driver-memory 6g --conf spark.sql.shuffle.partitions=64 /jobs/silver_transform.py baseline
 ```
 
-**3.2 — Silver (nettoyage + sessions) :**
+### Étape 6 — Analytique Gold (+ tables Hive)
+
 ```bash
-docker compose exec spark /opt/spark/bin/spark-submit \
-  --packages org.apache.hadoop:hadoop-aws:3.3.4 \
-  --conf spark.jars.ivy=/tmp/.ivy2 \
-  --driver-memory 6g \
-  --conf spark.sql.shuffle.partitions=64 \
-  /jobs/silver_transform.py
+docker compose exec spark /opt/spark/bin/spark-submit --jars /tmp/.ivy2/jars/org.apache.hadoop_hadoop-aws-3.3.4.jar,/tmp/.ivy2/jars/com.amazonaws_aws-java-sdk-bundle-1.12.262.jar,/tmp/.ivy2/jars/org.wildfly.openssl_wildfly-openssl-1.0.7.Final.jar --driver-memory 6g --conf spark.sql.shuffle.partitions=64 /jobs/gold_analytics.py
 ```
 
-**3.3 — Gold (analytique + tables Hive) :**
+### Vérification
+
+- **MinIO** http://localhost:9001 (minio / minio123) : buckets `bronze`, `silver`, `gold` remplis
+- **Spark** http://localhost:8080 : 1 worker ALIVE
+- Les 3 tables Gold sont dans Hive (base `gold`)
+
+**Rappel des options Spark et pourquoi :**
+| Option | Rôle |
+|---|---|
+| `--packages org.apache.hadoop:hadoop-aws:3.3.4` | télécharge le connecteur S3A (MinIO) |
+| `--conf spark.jars.ivy=/tmp/.ivy2` | évite l'erreur de cache Ivy de l'image officielle |
+| `--driver-memory 6g` | sans ça Spark tourne avec ~434 Mo et plante en OutOfMemory |
+| `--conf spark.sql.shuffle.partitions=64` | optimise le shuffle (sessions, agrégations) |
+| `--jars ...` (Gold) | au lieu de `--packages`, requis pour que Hive accède à S3A |
+
+---
+
+## 6. Mesure de performance (benchmark)
+
+Le job Silver est instrumenté : il chronomètre chaque étape et enregistre les résultats
+dans `s3a://gold/_benchmarks`.
+
+**Mesurer une version (label au choix) :**
 ```bash
-docker compose exec spark /opt/spark/bin/spark-submit \
-  --jars /tmp/.ivy2/jars/org.apache.hadoop_hadoop-aws-3.3.4.jar,/tmp/.ivy2/jars/com.amazonaws_aws-java-sdk-bundle-1.12.262.jar,/tmp/.ivy2/jars/org.wildfly.openssl_wildfly-openssl-1.0.7.Final.jar \
-  --driver-memory 6g \
-  --conf spark.sql.shuffle.partitions=64 \
-  /jobs/gold_analytics.py
+docker compose exec spark /opt/spark/bin/spark-submit --packages org.apache.hadoop:hadoop-aws:3.3.4 --conf spark.jars.ivy=/tmp/.ivy2 --driver-memory 6g --conf spark.sql.shuffle.partitions=64 /jobs/silver_transform.py baseline
 ```
 
-À la fin, vérifie sur MinIO (http://localhost:9001) : les buckets `bronze`, `silver`, `gold`
-contiennent les données. Les 3 tables Gold sont aussi enregistrées dans Hive (base `gold`).
+**Comparer plusieurs versions (baseline vs optimized) :**
+```bash
+# après une optimisation, relancer avec un autre label :
+docker compose exec spark /opt/spark/bin/spark-submit --packages org.apache.hadoop:hadoop-aws:3.3.4 --conf spark.jars.ivy=/tmp/.ivy2 --driver-memory 6g --conf spark.sql.shuffle.partitions=64 /jobs/silver_transform.py optimized
 
-### Étape 4 — Orchestration avec Airflow
+# puis afficher le comparatif avec le gain en % :
+docker compose exec spark /opt/spark/bin/spark-submit --packages org.apache.hadoop:hadoop-aws:3.3.4 --conf spark.jars.ivy=/tmp/.ivy2 /jobs/bench_compare.py
+```
 
-Airflow rejoue ce pipeline automatiquement (planifié `@daily`).
+**Résultats baseline mesurés (67,5 M lignes) :**
+| Étape | Durée (s) |
+|---|---|
+| lecture_bronze | 9,2 |
+| nettoyage_nuls | 42,1 |
+| ecriture_silver (déclenche sessions + dédup + typage) | 163,9 |
+| **TOTAL** | **215,8 (~3 min 36)** |
 
-**4.1 — Créer la base Airflow dans Postgres** (si pas déjà fait au premier démarrage) :
+> Les étapes intermédiaires affichent ~0s à cause de la *lazy evaluation* de Spark :
+> le calcul réel n'est déclenché qu'à l'écriture (la seule action), qui concentre 76 % du temps.
+
+---
+
+## 7. Orchestration Airflow
+
+### Étape 1 — Créer la base Airflow dans Postgres (une fois)
+
 ```bash
 docker compose exec postgres psql -U hive -d metastore -c "CREATE DATABASE airflow;"
 docker compose up -d airflow
 ```
 
-**4.2 — Dans l'UI Airflow** (http://localhost:8088, admin/admin) :
-1. Active le DAG `lakehouse_pipeline` (toggle à gauche du nom)
-2. Le « Next Run » affiche la prochaine exécution quotidienne
-3. Pour lancer tout de suite : bouton ▶ (Trigger DAG)
-4. Suis l'exécution dans la vue **Grid** : `bronze → silver → gold` passent au vert
+### Étape 2 — Utiliser l'interface
 
-Le DAG lance les jobs Spark via `docker exec` sur le conteneur Spark. Il est configuré avec
-`max_active_runs=1` pour éviter que plusieurs exécutions saturent la RAM en parallèle.
+Ouvre http://localhost:8088 (admin / admin) :
+1. Active le DAG `lakehouse_pipeline` (toggle à gauche)
+2. « Next Run » affiche la prochaine exécution (planifié `@daily`)
+3. Pour lancer maintenant : bouton ▶ (Trigger DAG)
+4. Vue **Grid** : `bronze → silver → gold` passent au vert
+
+Le DAG lance les jobs Spark via `docker exec` et limite à un seul run simultané
+(`max_active_runs=1`) pour éviter la saturation mémoire.
 
 ---
 
-## 6. Tests
-
-8 tests pytest valident la logique de transformation et la qualité des données.
+## 8. Tests
 
 ```bash
 pip install -r requirements-dev.txt
 pytest tests/ -v
 ```
 
-Résultat attendu : `8 passed`.
-
-- **test_transformations.py** : sessionization (gap 30 min), isolation par user, nettoyage des nuls, déduplication
-- **test_data_quality.py** : clés non nulles, prix positifs, event_types valides, invariant funnel (purchases ≤ carts ≤ views)
-
-La CI GitHub Actions (`.github/workflows/ci.yml`) lance ces tests à chaque push.
+Résultat attendu : `8 passed`. Tests sur les transformations (sessions, nettoyage,
+déduplication) et la qualité des données (clés non nulles, prix positifs, invariant funnel).
+Exécutés aussi en CI à chaque push (`.github/workflows/ci.yml`).
 
 ---
 
-## 7. Streaming temps réel (optionnel)
-
-Couche temps réel avec Kafka + Spark Structured Streaming.
+## 9. Streaming temps réel (optionnel)
 
 **Terminal 1 — Consumer** (CA + ventes en fenêtres glissantes) :
 ```bash
 docker compose exec spark pip install kafka-python
-docker compose exec spark /opt/spark/bin/spark-submit \
-  --jars /tmp/.ivy2/jars/org.apache.hadoop_hadoop-aws-3.3.4.jar,/tmp/.ivy2/jars/com.amazonaws_aws-java-sdk-bundle-1.12.262.jar,/tmp/.ivy2/jars/org.wildfly.openssl_wildfly-openssl-1.0.7.Final.jar \
-  --packages org.apache.spark:spark-sql-kafka-0-10_2.12:3.5.1 \
-  --conf spark.jars.ivy=/tmp/.ivy2 \
-  /jobs/streaming_consumer.py
+docker compose exec spark /opt/spark/bin/spark-submit --jars /tmp/.ivy2/jars/org.apache.hadoop_hadoop-aws-3.3.4.jar,/tmp/.ivy2/jars/com.amazonaws_aws-java-sdk-bundle-1.12.262.jar,/tmp/.ivy2/jars/org.wildfly.openssl_wildfly-openssl-1.0.7.Final.jar --packages org.apache.spark:spark-sql-kafka-0-10_2.12:3.5.1 --conf spark.jars.ivy=/tmp/.ivy2 /jobs/streaming_consumer.py
 ```
 
-**Terminal 2 — Producer** (rejoue un échantillon du CSV dans Kafka) :
+**Terminal 2 — Producer** (rejoue un échantillon dans Kafka) :
 ```bash
 docker compose exec spark python3 /jobs/kafka_producer.py /data/2019-Nov.csv --limit 50000 --rate 200
 ```
 
 ---
 
-## 8. Commandes utiles
+## 10. Commandes utiles
 
 ```bash
 docker compose ps -a                  # état des conteneurs
 docker compose logs <service> -f      # suivre les logs d'un service
 docker compose restart <service>      # redémarrer un seul service
-docker compose down                   # arrêter (garde les données)
-docker compose down -v                # arrêter + SUPPRIMER les volumes (reset total)
+docker compose stop                   # arrêter sans rien perdre
+docker compose down                   # arrêter + supprimer conteneurs (GARDE les données)
+docker compose down -v                # ⚠️ SUPPRIME les volumes (reset total)
 ```
+
+> ⚠️ **Ne jamais faire `docker compose down -v` sauf pour repartir de zéro.** Le `-v` efface
+> les volumes (données MinIO + base Hive), ce qui oblige à refaire tout le pipeline ET
+> réinitialiser le schéma Hive (étape 2). Pour un arrêt normal : `docker compose stop`.
 
 ---
 
-## 9. Pièges rencontrés & solutions (mémo de dépannage)
+## 11. Pièges rencontrés & solutions (mémo de dépannage)
 
 | Symptôme | Cause | Solution |
 |---|---|---|
-| `bitnami/spark:3.5 not found` | Bitnami a retiré ses images gratuites (août 2025) | Utiliser les images officielles `apache/spark`, `apache/kafka` |
-| Hive : `authentication type 10 is not supported` | Postgres 16 utilise scram-sha-256, le driver Hive ne le gère pas | Postgres **15** + `POSTGRES_HOST_AUTH_METHOD: md5` |
-| Hive redémarre en boucle, `relation already exists` | Hive réinitialise un schéma déjà présent | `IS_RESUME: "true"` dans le service Hive |
+| `bitnami/spark:3.5 not found` | Bitnami a retiré ses images gratuites (août 2025) | Images officielles `apache/spark`, `apache/kafka` |
+| Hive : `authentication type 10 is not supported` | Postgres 16 utilise scram-sha-256, incompatible driver Hive | Postgres **15** + `POSTGRES_HOST_AUTH_METHOD: md5` |
+| Hive boucle, `relation already exists` | Hive réinitialise un schéma déjà présent | `IS_RESUME: "true"` dans le service Hive |
+| Hive boucle, `Version information not found in metastore` | Base recréée vierge, schéma jamais initialisé | `docker compose run --rm -e IS_RESUME=false hive /opt/hive/bin/schematool -dbType postgres -initSchema` |
 | `spark-submit: executable not found` | Pas dans le PATH de l'image officielle | Chemin complet `/opt/spark/bin/spark-submit` |
 | Ivy : `FileNotFoundException ... resolved-...xml` | Cache Ivy non inscriptible | `--conf spark.jars.ivy=/tmp/.ivy2` |
 | `Path does not exist: /data/...` | Dossier data non monté dans Spark | Monter `./data:/data` dans spark + spark-worker |
 | `OutOfMemoryError: Java heap space` | Spark tourne avec 434 Mo par défaut | `--driver-memory 6g` |
-| `ClassNotFoundException: S3AFileSystem` (au Gold) | Hive n'a pas les JARs S3A | Copier les JARs dans `hive-jars/` (monté dans `/opt/hive/auxlib`) |
+| `ClassNotFoundException: S3AFileSystem` (au Gold) | Hive n'a pas les JARs S3A | Copier les JARs dans `hive-jars/` (étape 4) |
+| `Could not find file /tmp/.ivy2/jars/...` à la copie | JARs pas encore téléchargés | Lancer d'abord un job Spark avec `--packages` (étape 3) |
 | Airflow : tâches `up_for_retry` / runs parallèles | Plusieurs runs saturent la RAM | `max_active_runs=1` dans le DAG |
 
 ---
 
-## 10. Dataset
+## 12. Dataset
 
 [eCommerce behavior data from multi category store](https://www.kaggle.com/datasets/mkechinov/ecommerce-behavior-data-from-multi-category-store)
 — événements `view` / `cart` / `purchase`, octobre–novembre 2019.
 
 Schéma : `event_time, event_type, product_id, category_id, category_code, brand, price, user_id, user_session`.
 
-Le mois utilisé ici (`2019-Nov.csv`) contient **~67 millions d'événements** (~9 Go), ce qui
-justifie pleinement l'usage de Spark : un traitement mono-machine (Pandas) est impossible.
+Le mois utilisé (`2019-Nov.csv`) contient **~67 millions d'événements** (~9 Go), ce qui justifie
+pleinement l'usage de Spark : un traitement mono-machine (pandas) est impossible.

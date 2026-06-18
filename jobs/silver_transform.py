@@ -1,15 +1,26 @@
 """
-Phase 2 — Transformation Silver (avec mesure de performance)
+Phase 2 — Transformation Silver (avec mesure de performance + mode optimisé/non optimisé)
 Lit le Bronze brut (CSV), nettoie, type, recalcule les sessions (gap 30 min),
 ajoute les colonnes techniques, écrit en Parquet partitionné par jour
 dans s3a://silver/events. Chronométré via bench.py.
 
-Lancement (label optionnel pour comparer baseline vs optimized) :
+Deux modes pour le comparatif de performance :
+  - NON OPTIMISÉ (défaut) : pas de cache + shuffle partitions par défaut (200)
+      -> chaque action (count) relit et recalcule tout depuis le CSV
+  - OPTIMISÉ (--optimize) : cache du DataFrame + shuffle partitions = 64
+      -> les données lues une fois sont réutilisées, shuffle bien dimensionné
+
+Lancement NON OPTIMISÉ (label "baseline") :
   docker compose exec spark /opt/spark/bin/spark-submit \
     --packages org.apache.hadoop:hadoop-aws:3.3.4 \
-    --conf spark.jars.ivy=/tmp/.ivy2 \
-    --driver-memory 6g --conf spark.sql.shuffle.partitions=64 \
+    --conf spark.jars.ivy=/tmp/.ivy2 --driver-memory 6g \
     /jobs/silver_transform.py baseline
+
+Lancement OPTIMISÉ (label "optimized") :
+  docker compose exec spark /opt/spark/bin/spark-submit \
+    --packages org.apache.hadoop:hadoop-aws:3.3.4 \
+    --conf spark.jars.ivy=/tmp/.ivy2 --driver-memory 6g \
+    /jobs/silver_transform.py optimized --optimize
 """
 import sys
 from pyspark.sql import SparkSession, Window
@@ -17,6 +28,7 @@ from pyspark.sql import functions as F
 from pyspark.sql.types import (
     StructType, StructField, StringType, LongType, DoubleType,
 )
+from pyspark.storagelevel import StorageLevel
 from bench import Benchmark
 
 BRONZE_PATH = "s3a://bronze/events"
@@ -37,8 +49,8 @@ SCHEMA = StructType([
 ])
 
 
-def get_spark():
-    return (
+def get_spark(optimize):
+    builder = (
         SparkSession.builder.appName("silver_transform")
         .config("spark.hadoop.fs.s3a.endpoint", "http://minio:9000")
         .config("spark.hadoop.fs.s3a.access.key", "minio")
@@ -47,22 +59,29 @@ def get_spark():
         .config("spark.hadoop.fs.s3a.impl", "org.apache.hadoop.fs.s3a.S3AFileSystem")
         .config("spark.hadoop.fs.s3a.connection.ssl.enabled", "false")
         .config("spark.sql.session.timeZone", "UTC")
-        .getOrCreate()
     )
+    # OPTIMISATION 1 : nombre de partitions de shuffle adapté au volume.
+    # Sans ce réglage, Spark utilise 200 (défaut) -> trop de petites tâches.
+    if optimize:
+        builder = builder.config("spark.sql.shuffle.partitions", "64")
+    else:
+        builder = builder.config("spark.sql.shuffle.partitions", "200")
+    return builder.getOrCreate()
 
 
-def main(label="baseline"):
-    spark = get_spark()
+def main(label, optimize):
+    spark = get_spark(optimize)
     spark.sparkContext.setLogLevel("WARN")
     bench = Benchmark(spark, job_name="silver_transform", label=label)
+
+    mode = "OPTIMISÉ (cache + 64 partitions)" if optimize else "NON OPTIMISÉ (sans cache + 200 partitions)"
+    print(f"\n>> MODE : {mode}\n")
 
     # ---- Lecture du Bronze ----
     with bench.step("lecture_bronze"):
         df = (
             spark.read.option("header", "true").schema(SCHEMA).csv(BRONZE_PATH)
         )
-        n_raw = df.count()
-    print(f"   Lignes Bronze : {n_raw:,}")
 
     # ---- Typage ----
     with bench.step("typage"):
@@ -84,9 +103,17 @@ def main(label="baseline"):
         key_cols = ["event_time", "event_type", "user_id", "user_session"]
         df = df.dropna(subset=key_cols)
 
+        # OPTIMISATION 2 : cache. Le DataFrame est relu plusieurs fois ci-dessous
+        # (3 count + l'écriture finale). Sans cache, Spark recalcule TOUTE la chaîne
+        # (lecture CSV + typage + dropna) à chaque action -> très coûteux.
+        if optimize:
+            df = df.persist(StorageLevel.MEMORY_AND_DISK)
+
+        # Plusieurs actions : c'est ici que l'absence de cache fait mal
         n_after_keys = df.count()
         n_price_null = df.filter(F.col("price").isNull()).count()
         price_null_rate = n_price_null / n_after_keys if n_after_keys else 0
+        print(f"   Lignes après nettoyage clés : {n_after_keys:,}")
         print(f"   Taux de nuls sur price : {price_null_rate:.2%}")
 
         if price_null_rate == 0:
@@ -105,7 +132,7 @@ def main(label="baseline"):
     with bench.step("deduplication"):
         df = df.dropDuplicates()
 
-    # ---- Sessionization (étape la plus coûteuse : shuffle massif) ----
+    # ---- Sessionization ----
     with bench.step("sessionization"):
         w = Window.partitionBy("user_id").orderBy("event_time")
         gap_sec = SESSION_GAP_MIN * 60
@@ -134,7 +161,7 @@ def main(label="baseline"):
             .withColumn("ingestion_ts", F.current_timestamp())
         )
 
-    # ---- Écriture Silver (déclenche tout le calcul) ----
+    # ---- Écriture Silver ----
     with bench.step("ecriture_silver"):
         (
             df.write
@@ -143,12 +170,14 @@ def main(label="baseline"):
             .parquet(SILVER_PATH)
         )
 
-    # ---- Récap performance ----
     bench.report()
-    print(">> Transformation Silver terminée ✓")
+    print(f">> Transformation Silver terminée ✓  [{mode}]")
     spark.stop()
 
 
 if __name__ == "__main__":
-    label = sys.argv[1] if len(sys.argv) > 1 else "baseline"
-    main(label)
+    # 1er argument = label (baseline / optimized) ; --optimize active les optimisations
+    args = [a for a in sys.argv[1:] if not a.startswith("--")]
+    label = args[0] if args else "baseline"
+    optimize = "--optimize" in sys.argv
+    main(label, optimize)

@@ -11,6 +11,7 @@ Lancement :
 """
 from pyspark.sql import SparkSession
 from pyspark.sql import functions as F
+from pyspark.sql.window import Window
 
 BENCH_PATH = "s3a://gold/_benchmarks"
 
@@ -35,15 +36,14 @@ def main():
     df = spark.read.option("header", "true").csv(BENCH_PATH)
     df = df.withColumn("duration_sec", F.col("duration_sec").cast("double"))
 
-    # On garde, pour chaque (job, label, step), le dernier run mesuré
-    latest = (
-        df.groupBy("job", "label", "step")
-        .agg(F.max("timestamp").alias("ts"))
+    # Pour chaque (job, label, step), on garde le run le plus récent.
+    # On utilise une window (pas un self-join) pour éviter l'ambiguïté de colonnes.
+    w = Window.partitionBy("job", "label", "step").orderBy(F.desc("timestamp"))
+    runs = (
+        df.withColumn("rn", F.row_number().over(w))
+        .filter(F.col("rn") == 1)
+        .select("job", "label", "step", "duration_sec")
     )
-    runs = df.join(latest,
-                   (df.job == latest.job) & (df.label == latest.label) &
-                   (df.step == latest.step) & (df.timestamp == latest.ts)) \
-             .select(df.job, df.label, df.step, df.duration_sec)
 
     print("\n========== COMPARATIF DES BENCHMARKS ==========\n")
 
@@ -57,15 +57,17 @@ def main():
             .agg(F.first("duration_sec"))
         )
         labels = [c for c in pivot.columns if c != "step"]
-        # Si on a baseline + optimized : calcul du gain
+        # Si on a baseline + optimized : calcul du gain en %
         if "baseline" in labels and "optimized" in labels:
             pivot = pivot.withColumn(
                 "gain_%",
                 F.round(100 * (F.col("baseline") - F.col("optimized")) / F.col("baseline"), 1),
             )
-        pivot.orderBy(
+        # TOTAL en dernier, le reste par ordre alphabétique
+        pivot = pivot.orderBy(
             F.when(F.col("step") == "TOTAL", 1).otherwise(0), "step"
-        ).show(truncate=False)
+        )
+        pivot.show(truncate=False)
 
     print("===============================================\n")
     spark.stop()
